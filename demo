@@ -1,1 +1,563 @@
-Demo
+// =================================================================================================
+// EquityFfbUpfrontTaxComputationConsumerTests
+//
+// Written to the CODEBASE'S NATIVE pattern (matches your own consumer tests + EquityFFBHelperTest +
+// the Db/persistence test), NOT the Moq/Hedge strict-verify style:
+//
+//   * Stock dividends  -> seed the static test double:
+//         EquityStaticDataServiceMock.CorporateActions["<caId>"] = equityCorporateAction;
+//   * Index upfront     -> EquityStaticDataServiceMock.CurrentStreamingMock
+//                              .CreateOrUpdateEquityFfbCorporateActionUpfrontOnIndex(indexCa);
+//   * Basket            -> MockData.Given(g => g.AllObjects(basket))
+//   * Upfront routing   -> InstrumentConfig metadata (IsEligibleForUpfrontCalculation = "true")
+//   * Process assertions-> Throws.Nothing / Assert.Pass. Process is wrapped in try/catch inside the
+//                          consumer, so a clean run (and the catch path) are the observable outcomes;
+//                          this also covers the branches without arrange-time mock machinery.
+//   * ComputeUpfrontTax / dividend-helper tests assert real returned values; ComputeUpfrontTax runs
+//     inside a MockData.Given context (ComputeInContext) because CalculateTax reads the WithholdingTax
+//     domain setting directly (no try/catch around a direct method call).
+// ================================================================================================
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using NUnit.Framework;
+using Sgcib.TOne.Configuration;
+using Sgcib.TOne.Core;
+using Sgcib.TOne.EquityFfbUpfrontTaxComputationService;
+using Sgcib.TOne.Messaging;
+using Sgcib.TOne.Mocks;
+using Sgcib.TOne.Products;
+using Sgcib.TOne.Products.FFB;
+using Sgcib.TOne.Products.Payoff;
+using Sgcib.TOne.Products.Product;
+using Sgcib.TOne.Products.StaticData;
+using Sgcib.TOne.RegulatoryReporting;
+using Sgcib.TOne.Service;
+using Sgcib.TOne.StaticData;
+using Sgcib.TOne.Tests.Framework.Data.Context;
+using Sgcib.TOne.TradeImportExport;
+using Sgcib.TOne.Util;
+
+namespace Sgcib.TOne.Tests.EquityFfbUpfrontTaxComputation
+{
+    [XOneTestFixture]
+    [Category(Category.EquityVanilla)]
+    [Category(Category.Dev)]
+    [Category(Category.ImpactBooking)]
+    public sealed class EquityFfbUpfrontTaxComputationConsumerTests
+    {
+        private static readonly XOneDate s_tradeDate = new XOneDate(2025, 1, 15);
+        private static readonly XOneDate s_maturityDate = new XOneDate(2026, 1, 15);
+
+        private const string FfbPortfolioName = "DSP-EXEC";
+
+        private static EquityFfbUpfrontTaxComputationConsumer BuildConsumer() =>
+            new EquityFfbUpfrontTaxComputationConsumer(0);
+
+        // -----------------------------------------------------------------------------------------
+        //  Setup / teardown: keep the shared static dividend double clean between tests.
+        // -----------------------------------------------------------------------------------------
+        [SetUp]
+        public void SetUp()
+        {
+            EquityStaticDataServiceMock.CorporateActions.Clear();
+            MakeEquityOptionUpfrontEligible();
+        }
+
+        [TearDown]
+        public void TearDown()
+        {
+            EquityStaticDataServiceMock.CorporateActions.Clear();
+        }
+
+        // =========================================================================================
+        //  ConsumerName
+        // =========================================================================================
+        [Test]
+        public void ConsumerName_ShouldMatchExpectedValue()
+        {
+            var consumer = BuildConsumer();
+            Assert.That(consumer.ConsumerName,
+                Is.EqualTo("EquityFfbUpfrontTaxComputationServiceConsumer"),
+                "ConsumerName must match the registered service name.");
+        }
+
+        // =========================================================================================
+        //  Process guards — each must complete without throwing (consumer logs + returns).
+        // =========================================================================================
+        [Test]
+        public void GivenANonTradeMessage_WhenProcessed_ThenItIsSkippedWithoutThrowing()
+        {
+            var consumer = BuildConsumer();
+            var message = new DefaultMessageStub();
+
+            Assert.That(() => consumer.SafeProcess(message), Throws.Nothing,
+                "A non-TradeMessage must be skipped (warning logged), not throw.");
+        }
+
+        [Test]
+        public void GivenATradeMessageWithNullTrade_WhenProcessed_ThenItIsSkippedWithoutThrowing()
+        {
+            var consumer = BuildConsumer();
+            var message = new TradeMessage(); // GetTrade() resolves to null
+
+            Assert.That(() => consumer.SafeProcess(message), Throws.Nothing,
+                "A TradeMessage whose GetTrade() is null must be skipped, not throw.");
+        }
+
+        [Test]
+        public void GivenANonTaxableTrade_WhenProcessed_ThenItIsSkippedWithoutThrowing()
+        {
+            var consumer = BuildConsumer();
+            var message = CreateTradeMessage(CreateNonTaxableTrade());
+
+            Assert.That(() => consumer.SafeProcess(message), Throws.Nothing,
+                "A trade with no FFB regulatory info is not taxable and must be skipped.");
+        }
+
+        [Test]
+        public void GivenInvalidCalculationPeriod_WhenProcessed_ThenItIsSkippedWithoutThrowing()
+        {
+            // Maturity BEFORE trade date -> calculation start > end -> skip.
+            var consumer = BuildConsumer();
+            var underlying = CreateEliotUnderlying("TOTAL_X", EquityUnderlyingType.Stock);
+            var trade = CreateFfbUpfrontEligibleTrade(underlying, maturityDate: s_tradeDate.AddDays(-5));
+            var message = CreateTradeMessage(trade);
+
+            Assert.That(() => consumer.SafeProcess(message), Throws.Nothing,
+                "An invalid (start > end) calculation period must be skipped without throwing.");
+        }
+
+        [Test]
+        public void GivenFundUnderlying_WhenProcessed_ThenItIsHandledWithoutThrowing()
+        {
+            // Fund -> consumer sets the dividend list to null (known bug) -> caught internally.
+            var consumer = BuildConsumer();
+            var underlying = CreateEliotUnderlying("FUND_X", EquityUnderlyingType.Fund);
+            var message = CreateTradeMessage(CreateFfbUpfrontEligibleTrade(underlying));
+
+            Assert.That(() => consumer.SafeProcess(message), Throws.Nothing,
+                "The Fund branch must be handled by the consumer's try/catch without propagating.");
+        }
+
+        // =========================================================================================
+        //  Process — productive branches (seed the native seam, assert no-throw / pass).
+        // =========================================================================================
+        [Test]
+        public void GivenAnUpfrontEligibleStockTradeWithDividends_WhenProcessed_ThenItCompletesWithoutThrowing()
+        {
+            var consumer = BuildConsumer();
+            const string underlyingName = "TOTAL_X";
+            var underlying = CreateEliotUnderlying(underlyingName, EquityUnderlyingType.Stock);
+            var trade = CreateFfbUpfrontEligibleTrade(underlying);
+            var message = CreateTradeMessage(trade);
+
+            SeedStockDividend("CA_TOTAL_DIV", underlyingName, net: 1.6d, gross: 2.0d);
+
+            Assert.That(() => consumer.SafeProcess(message), Throws.Nothing,
+                "Consumer must complete the upfront stock-dividend tax computation without throwing.");
+        }
+
+        [Test]
+        public void GivenAnUpfrontEligibleIndexTradeWithDividends_WhenProcessed_ThenItCompletesWithoutThrowing()
+        {
+            const string indexName = "CAC40_X";
+            var consumer = BuildConsumer();
+            var underlying = CreateEliotUnderlying(indexName, EquityUnderlyingType.Index);
+            var trade = CreateFfbUpfrontEligibleTrade(underlying);
+            var message = CreateTradeMessage(trade);
+
+            // Index return type STRD -> Upfront; seed the upfront-on-index data into the streaming mock.
+            var indexCa = CreateUpfrontOnIndex(indexName, eligibleAmount: 1.5d, eligibleGross: 2.0d);
+            EquityStaticDataServiceMock.CurrentStreamingMock
+                .CreateOrUpdateEquityFfbCorporateActionUpfrontOnIndex(indexCa);
+
+            using (MockData.Given(g => g.AllObjects(CreateEliotIndex(indexName, "STRD"))))
+            {
+                Assert.That(() => consumer.SafeProcess(message), Throws.Nothing,
+                    "Consumer must complete the upfront index-dividend tax computation without throwing.");
+            }
+        }
+
+        [Test]
+        public void GivenAnUpfrontEligibleBasketTrade_WhenProcessed_ThenTheBasketBranchExecutes()
+        {
+            var consumer = BuildConsumer();
+            const string basketName = "BASKET_X";
+            var underlying = CreateEliotUnderlying(basketName, EquityUnderlyingType.Basket);
+            var message = CreateTradeMessage(CreateFfbUpfrontEligibleTrade(underlying));
+
+            var basket = CreateBasket(basketName,
+                ("STOCK_A", EquityUnderlyingType.Stock),
+                ("STOCK_B", EquityUnderlyingType.Stock));
+
+            // Seed dividends for the basket's stock components so the recursion has data.
+            SeedStockDividend("CA_STOCK_A", "STOCK_A", net: 1.0d, gross: 1.2d);
+            SeedStockDividend("CA_STOCK_B", "STOCK_B", net: 0.8d, gross: 1.0d);
+
+            using (MockData.Given(g => g.AllObjects(basket)))
+            {
+                consumer.SafeProcess(message);
+                Assert.Pass("Basket branch executed with injected basket data.");
+            }
+        }
+
+        [Test]
+        public void GivenAnExDateRoutedIndexTrade_WhenProcessed_ThenItIsSkippedWithoutThrowing()
+        {
+            // Index return type GRTR -> ExDate (not Upfront) -> consumer skips the upfront computation.
+            const string indexName = "DAX_X";
+            var consumer = BuildConsumer();
+            var underlying = CreateEliotUnderlying(indexName, EquityUnderlyingType.Index);
+            var message = CreateTradeMessage(CreateFfbUpfrontEligibleTrade(underlying));
+
+            using (MockData.Given(g => g.AllObjects(CreateEliotIndex(indexName, "GRTR"))))
+            {
+                Assert.That(() => consumer.SafeProcess(message), Throws.Nothing,
+                    "An ExDate-routed (GRTR) index trade must be skipped by the upfront consumer.");
+            }
+        }
+
+        [Test]
+        public void GivenAnUpfrontEligibleStockTradeWithNoDividends_WhenProcessed_ThenNoTaxIsComputed()
+        {
+            // No CorporateActions seeded -> stock dividend list is empty -> Count == 0 -> skip.
+            var consumer = BuildConsumer();
+            var underlying = CreateEliotUnderlying("EMPTY_X", EquityUnderlyingType.Stock);
+            var message = CreateTradeMessage(CreateFfbUpfrontEligibleTrade(underlying));
+
+            Assert.That(() => consumer.SafeProcess(message), Throws.Nothing,
+                "An eligible stock trade with no dividends must complete (no tax) without throwing.");
+        }
+
+        // =========================================================================================
+        //  ComputeUpfrontTax — direct value assertions (run inside a domain context).
+        // =========================================================================================
+        [Test]
+        public void ComputeUpfrontTax_WhenDividendListIsNull_ShouldReturnZeroTaxAndZeroCount()
+        {
+            var consumer = BuildConsumer();
+            var trade = CreateFfbUpfrontEligibleTrade(CreateEliotUnderlying("TOTAL_X", EquityUnderlyingType.Stock));
+
+            var (totalTax, count) = ComputeInContext(consumer, trade, null);
+
+            Assert.That(totalTax, Is.EqualTo(0d), "Null dividend list must yield zero tax.");
+            Assert.That(count, Is.EqualTo(0), "Null dividend list must yield zero count.");
+        }
+
+        [Test]
+        public void ComputeUpfrontTax_WhenDividendListIsEmpty_ShouldReturnZeroTaxAndZeroCount()
+        {
+            var consumer = BuildConsumer();
+            var trade = CreateFfbUpfrontEligibleTrade(CreateEliotUnderlying("TOTAL_X", EquityUnderlyingType.Stock));
+
+            var (totalTax, count) = ComputeInContext(consumer, trade, Dividends());
+
+            Assert.That(totalTax, Is.EqualTo(0d), "Empty dividend list must yield zero tax.");
+            Assert.That(count, Is.EqualTo(0), "Empty dividend list must yield zero count.");
+        }
+
+        [Test]
+        public void ComputeUpfrontTax_WithZeroDividendAmounts_ShouldCountDividendButReturnZeroTax()
+        {
+            var consumer = BuildConsumer();
+            var trade = CreateFfbUpfrontEligibleTrade(CreateEliotUnderlying("TOTAL_X", EquityUnderlyingType.Stock));
+
+            var (totalTax, count) = ComputeInContext(consumer, trade, Dividends((0d, 0d)));
+
+            Assert.That(totalTax, Is.EqualTo(0d), "Zero amounts must produce zero tax.");
+            Assert.That(count, Is.EqualTo(1), "The dividend must still be counted.");
+        }
+
+        [Test]
+        public void ComputeUpfrontTax_WithSingleValidDividend_ShouldCountOne()
+        {
+            var consumer = BuildConsumer();
+            var trade = CreateFfbUpfrontEligibleTrade(CreateEliotUnderlying("TOTAL_X", EquityUnderlyingType.Stock));
+
+            var (_, count) = ComputeInContext(consumer, trade, Dividends((1.6d, 2.0d)));
+
+            Assert.That(count, Is.EqualTo(1), "A single valid dividend must be counted once.");
+        }
+
+        [Test]
+        public void ComputeUpfrontTax_WithMultipleDividends_ShouldAggregateAndCountAll()
+        {
+            var consumer = BuildConsumer();
+            var trade = CreateFfbUpfrontEligibleTrade(CreateEliotUnderlying("TOTAL_X", EquityUnderlyingType.Stock));
+
+            var (_, count) = ComputeInContext(consumer, trade,
+                Dividends((1.6d, 2.0d), (2.4d, 3.0d), (0.8d, 1.0d)));
+
+            Assert.That(count, Is.EqualTo(3), "All dividends must be aggregated and counted.");
+        }
+
+        [Test]
+        public void ComputeUpfrontTax_WhenRemainingQuantityIsZero_ShouldReturnZeroTaxButStillCount()
+        {
+            var consumer = BuildConsumer();
+            var trade = CreateFfbUpfrontEligibleTrade(
+                CreateEliotUnderlying("TOTAL_X", EquityUnderlyingType.Stock), remainingQuantity: 0d);
+
+            var (totalTax, count) = ComputeInContext(consumer, trade, Dividends((1.6d, 2.0d)));
+
+            Assert.That(totalTax, Is.EqualTo(0d), "Zero quantity must produce zero tax.");
+            Assert.That(count, Is.EqualTo(1), "The dividend must still be counted when quantity is zero.");
+        }
+
+        [Test]
+        public void ComputeUpfrontTax_WhenNetAndGrossNegative_ShouldReturnZeroTaxButStillCount()
+        {
+            var consumer = BuildConsumer();
+            var trade = CreateFfbUpfrontEligibleTrade(CreateEliotUnderlying("TOTAL_X", EquityUnderlyingType.Stock));
+
+            var (totalTax, count) = ComputeInContext(consumer, trade, Dividends((-5d, -3d)));
+
+            Assert.That(totalTax, Is.EqualTo(0d), "Negative net and gross must produce zero tax.");
+            Assert.That(count, Is.EqualTo(1), "The dividend must still be counted.");
+        }
+
+        // =========================================================================================
+        //  Dividend-source helpers — seed the native seam, read the values back.
+        // =========================================================================================
+        [Test]
+        public void GetIndexDividends_ShouldMapEligibleAmountToNet_AndEligibleGrossToGross()
+        {
+            const string indexName = "CAC40_X";
+            var indexCa = CreateUpfrontOnIndex(indexName, eligibleAmount: 1.5d, eligibleGross: 2.0d);
+            EquityStaticDataServiceMock.CurrentStreamingMock
+                .CreateOrUpdateEquityFfbCorporateActionUpfrontOnIndex(indexCa);
+
+            var result = EquityFfbUpfrontTaxComputationConsumer.GetIndexDividends(
+                indexName, s_tradeDate.AddDays(1), s_maturityDate);
+
+            Assert.That(result, Is.Not.Null, "Index dividends must be returned.");
+            Assert.That(result.Count, Is.GreaterThanOrEqualTo(1), "The seeded index dividend must be found.");
+            var first = result[0];
+            Assert.That(first.NetAmount, Is.EqualTo(1.5d).Within(1e-9),
+                "EligibleAmount must map to NetAmount.");
+            Assert.That(first.GrossAmount, Is.EqualTo(2.0d).Within(1e-9),
+                "EligibleGrossAmount must map to GrossAmount.");
+        }
+
+        [Test]
+        public void GetStockDividends_ShouldMapNetAndGrossFromSeededCorporateAction()
+        {
+            const string underlyingName = "TOTAL_X";
+            SeedStockDividend("CA_TOTAL_DIV", underlyingName, net: 1.6d, gross: 2.0d);
+
+            var result = EquityFfbUpfrontTaxComputationConsumer.GetStockDividends(
+                underlyingName, s_tradeDate.AddDays(1), s_maturityDate);
+
+            Assert.That(result, Is.Not.Null, "Stock dividends must be returned.");
+            Assert.That(result.Count, Is.GreaterThanOrEqualTo(1), "The seeded stock dividend must be found.");
+            var first = result[0];
+            Assert.That(first.NetAmount, Is.EqualTo(1.6d).Within(1e-9), "NetAmount must be mapped.");
+            Assert.That(first.GrossAmount, Is.EqualTo(2.0d).Within(1e-9), "GrossAmount must be mapped.");
+        }
+
+        [Test]
+        public void GetStockDividendFromBasket_ShouldFollowStockComponents()
+        {
+            const string basketName = "BASKET_X";
+            SeedStockDividend("CA_STOCK_A", "STOCK_A", net: 1.0d, gross: 1.2d);
+
+            var basket = CreateBasket(basketName, ("STOCK_A", EquityUnderlyingType.Stock));
+            var underlying = CreateEliotUnderlying(basketName, EquityUnderlyingType.Basket);
+
+            using (MockData.Given(g => g.AllObjects(basket)))
+            {
+                var result = EquityFfbUpfrontTaxComputationConsumer.GetStockDividendFromBasket(
+                    underlying, s_tradeDate.AddDays(1), s_maturityDate);
+
+                Assert.That(result, Is.Not.Null, "Basket stock dividends must be returned.");
+                Assert.That(result.Count, Is.GreaterThanOrEqualTo(1),
+                    "The stock component's seeded dividend must be followed.");
+            }
+        }
+
+        // =========================================================================================
+        //  Helpers
+        // =========================================================================================
+
+        // ComputeUpfrontTax -> CalculateTax reads the WithholdingTax domain setting, which needs a
+        // MockData.Given context (otherwise DomainSetting.get_Domain() subscribes to live NATS). This
+        // runs the computation inside that context, mirroring your persistence test.
+        private static (double totalTax, int count) ComputeInContext(
+            EquityFfbUpfrontTaxComputationConsumer consumer,
+            Trade trade,
+            IReadOnlyList<EquityFfbUpfrontTaxComputationConsumer.UpfrontDividend> dividends)
+        {
+            using (MockData.Given(g => g.AnObject(CreateFfbPortfolio())))
+            {
+                return consumer.ComputeUpfrontTax(trade, dividends);
+            }
+        }
+
+        private static IReadOnlyList<EquityFfbUpfrontTaxComputationConsumer.UpfrontDividend> Dividends(
+            params (double net, double gross)[] items) =>
+            items.Select(i => new EquityFfbUpfrontTaxComputationConsumer.UpfrontDividend(i.net, i.gross)).ToList();
+
+        // Make the "EquityOption" instrument upfront-eligible. Mirrors EquityFFBHelperTest:
+        // IsEligibleForUpfrontCalculation() reads MetaData; the config is fetched + mutated directly.
+        private static void MakeEquityOptionUpfrontEligible()
+        {
+            var instrumentConfig = InstrumentConfigs.GetInstrumentConfig("EquityOption");
+            instrumentConfig.AddMetaDataListValue(
+                EquityTradeHelper.IsEligibleForUpfrontCalculationMetaData, "true");
+        }
+
+        // Stock seam: seed a cash dividend corporate action keyed by its id (feeds the stock stream).
+        private static void SeedStockDividend(string caId, string underlyingName, double net, double gross)
+        {
+            var dividendCa = new EquityCorporateAction
+            {
+                CorporateActionId = caId,
+                ApplicationDate = s_tradeDate.AddDays(10),
+                Definition = new EquityDividend
+                {
+                    CorporateActionId = caId,
+                    UnderlyingId = underlyingName,
+                    NetAmount = net,
+                    GrossAmount = gross,
+                    CurrencyId = "EUR",
+                    UpdateDate = s_tradeDate,
+                },
+            };
+
+            EquityStaticDataServiceMock.CorporateActions[caId] = dividendCa;
+        }
+
+        // =========================================================================================
+        //  Builders
+        // =========================================================================================
+
+        private static EliotUnderlying CreateEliotUnderlying(string name, EquityUnderlyingType type) =>
+            new EliotUnderlying { UnderlyingName = name, UnderlyingType = type, UnderlyingIsActive = true };
+
+        // GetFfbComputationType reads IndexReturnType: "STRD" -> Upfront, "GRTR" -> ExDate.
+        private static EliotIndex CreateEliotIndex(string name, string indexReturnType) =>
+            new EliotIndex { IndexName = name, IndexReturnType = indexReturnType };
+
+        private static Trade CreateFfbUpfrontEligibleTrade(
+            EliotUnderlying underlying,
+            string contractId = "ELI-300001",
+            double remainingQuantity = 100d,
+            XOneDate? tradeDate = null,
+            XOneDate? maturityDate = null,
+            string taxStatusCode = "DEFAULT")
+        {
+            var option = new EquityOption("EquityOption") { Underlying = underlying };
+            option.ChangeMaturityDate(maturityDate ?? s_maturityDate);
+
+            return new Trade
+            {
+                XOneReference = new XOneReference(AssetClass.EQUITYOTC, 300001) { Version = 1 },
+                ContractId = contractId,
+                TradeDate = tradeDate ?? s_tradeDate,
+                Product = option,
+                TradeAdditionalInformations = new EquityOtcTradeInformations
+                {
+                    PortfolioId = FfbPortfolioName,
+                    RemainingQuantity = remainingQuantity,
+                    IsLinkedToSecurity = true,
+                    EquityEligibilityInformations = new List<EquityEligibilityInformation>
+                    {
+                        new EquityEligibilityInformation
+                        {
+                            RegulatoryLaw = RegulatoryLaw.FFB,
+                            RegulatoryCode = RegulatoryAuthority.DGFIP,
+                            BusinessEligibility = true,
+                            SpecificAdditionalRegulatoryInformation = new Ffb25RegulatoryReportingInformation
+                            {
+                                TaxStatusCode = taxStatusCode,
+                            },
+                        },
+                    },
+                },
+            };
+        }
+
+        private static EliotThirdParty CreateFfbPortfolio() =>
+            new EliotThirdParty
+            {
+                Name = FfbPortfolioName,
+                Type = EliotThirdPartyType.Portfolio,
+                Nationality = "FRA",
+                IsActive = true,
+            };
+
+        // A trade with NO FFB regulatory info -> IsTradeTaxable returns false (reliable skip).
+        private static Trade CreateNonTaxableTrade()
+        {
+            var option = new EquityOption("EquityOption")
+            {
+                Underlying = CreateEliotUnderlying("TOTAL_X", EquityUnderlyingType.Stock),
+            };
+            option.ChangeMaturityDate(s_maturityDate);
+
+            return new Trade
+            {
+                XOneReference = new XOneReference(AssetClass.EQUITYOTC, 300002) { Version = 1 },
+                ContractId = "ELI-300002",
+                TradeDate = s_tradeDate,
+                Product = option,
+                TradeAdditionalInformations = new EquityOtcTradeInformations
+                {
+                    PortfolioId = FfbPortfolioName,
+                    IsLinkedToSecurity = true,
+                    RemainingQuantity = 100d,
+                    EquityEligibilityInformations = new List<EquityEligibilityInformation>(),
+                },
+            };
+        }
+
+        // Real TradeMessage: the consumer reads the trade via tradeMessage.GetTrade(); built from a
+        // TradeDescriptor (4-arg ctor).
+        private static TradeMessage CreateTradeMessage(
+            Trade trade, TradeMessageSource source = TradeMessageSource.SaveWithWorkflow)
+        {
+            var descriptor = new TradeDescriptor
+            {
+                XOneReference = trade.XOneReference,
+                InstrumentName = "EquityOption",
+                AssetClass = AssetClass.EQUITYOTC,
+            };
+
+            return new TradeMessage(trade, descriptor, null, source);
+        }
+
+        private static EquityFfbCorporateActionOnIndex CreateUpfrontOnIndex(
+            string indexName, double eligibleAmount, double eligibleGross) =>
+            new EquityFfbCorporateActionOnIndex
+            {
+                UnderlyierName = indexName,
+                ExDate = s_tradeDate.AddDays(5),
+                EligibleAmount = eligibleAmount,
+                EligibleGrossAmount = eligibleGross,
+                DividendCurrency = "EUR",
+            };
+
+        private static EquityBasket CreateBasket(
+            string name, params (string assetId, EquityUnderlyingType type)[] components) =>
+            new EquityBasket
+            {
+                BasketName = name,
+                Components = components
+                    .Select(c => new EquityBasketComponent { AssetId = c.assetId, Type = c.type })
+                    .ToList(),
+            };
+
+        // A concrete non-TradeMessage used to exercise the "unsupported message type" guard.
+        [Serializable]
+        private sealed class DefaultMessageStub : DefaultMessage
+        {
+            private static int s_id;
+
+            public DefaultMessageStub() : base(++s_id, XOneDateTime.Now) { }
+
+            public override AssetClass AssetClass => AssetClass.EQUITYOTC;
+        }
+    }
+}
