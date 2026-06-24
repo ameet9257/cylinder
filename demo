@@ -1,1 +1,917 @@
-kkk
+// ============================================================================================
+//  EquityFfbUpfrontTaxComputationConsumerTest
+//
+//  Matches HedgeBookingServiceConsumerTest conventions: [XOneTestFixture] + 4 [Category],
+//  sealed class, strict Mock<>(MockBehavior.Strict), one behaviour per test, builders + mock
+//  factories at the bottom.
+//
+//  Anchored to the CURRENT consumer (typed out by the user), no guessing:
+//    Process(): not-TradeMessage -> Warn+return
+//               var trade = tradeMessage.GetTrade();
+//               var reference = trade.XOneReference;        // lock ref comes off the trade
+//               lockToken = LockToken.ReserveToken(...); if null -> Warn+return
+//               IsMessageProcessed(id, Name, AssetClass) == true -> Info+return     (3-arg)
+//               MarkMessageAsProcessing(id, Name, AssetClass) != 1 -> Warn+return    (3-arg)
+//               Check.ArgumentNotNull(trade); ProcessTrade(trade);
+//               IsSuccess ? MarkProcessed : MarkErrored; catch -> MarkErrored; finally -> ReleaseToken
+//    MarkProcessed -> MarkProcessingMessageAsProcessed(id, Name, XOneDateTime, AssetClass)  (4-arg)
+//    MarkErrored   -> real interface MarkProcessingMessageAsErrored(long,string,XOneDateTime,
+//                     AssetClass, ErroredMessage, string)                                   (6-arg)
+//
+//  Trade is carried ON the message: new TradeMessage(trade, descriptor, null, source) sets
+//  _innerTrade, so tradeMessage.GetTrade() returns it WITHOUT any DB/cache/NATS call.
+//
+//  Tax formula: quantity * delta * pointValue * min(totalNet, totalGross); taxRate is a GATE
+//  only (0 < r < 1). EquityEligibilityInformation property is the codebase spelling
+//  "BusinessEligiblility" (confirmed by the compiler).
+//
+//  RUNTIME-CONFIRM (the only thing not provable offline): the 3 happy-path trades must return
+//  FfbComputationType.Upfront so they reach the dividend fetch. No Upfront recipe was available,
+//  so they use hand-built EquityOption trades (as in the original file). If one logs a skip or a
+//  NATS "Invalid subject" error, rebuild that trade via InstrumentConfigs (like the not-Upfront
+//  test) with an Upfront-yielding shape.
+// ============================================================================================
+
+using System;
+using System.Collections.Generic;
+using Moq;
+using NUnit.Framework;
+using Sgcib.TOne.Core;
+using Sgcib.TOne.EquityFfbUpfrontTaxComputationService;
+using Sgcib.TOne.Messaging;
+using Sgcib.TOne.Mocks;
+using Sgcib.TOne.Products.FFB;
+using Sgcib.TOne.Products.Payoff;
+using Sgcib.TOne.Products.Product;
+using Sgcib.TOne.Products.StaticData;
+using Sgcib.TOne.Products.Util;
+using Sgcib.TOne.RegulatoryReporting;
+using Sgcib.TOne.Service;
+using Sgcib.TOne.StaticData;
+using Sgcib.TOne.Tests.Framework.Data.Context;
+using Sgcib.TOne.TradeImportExport;
+using Sgcib.TOne.Util;
+
+namespace Sgcib.TOne.EquityFfbUpfrontTaxComputationService.Tests
+{
+    [XOneTestFixture]
+    [Category(Category.EquityVanilla)]
+    [Category(Category.Dev)]
+    [Category(Category.ImpactBooking)]
+    public sealed class EquityFfbUpfrontTaxComputationConsumerTest
+    {
+        private const string ConsumerName = EquityFfbUpfrontTaxComputationConsumer.ConsumerName;
+
+        private static readonly XOneDate s_tradeDate = new XOneDate(2025, 1, 15);
+        private static readonly XOneDate s_maturityDate = new XOneDate(2026, 1, 15);
+
+        private static EquityFfbUpfrontTaxComputationConsumer BuildConsumer() =>
+            new EquityFfbUpfrontTaxComputationConsumer(0);
+
+        [Test]
+        public void ConsumerName_ShouldMatchExpectedValue()
+        {
+            // Arrange
+            const string expected = "EquityFfbUpfrontTaxComputationServiceConsumer";
+
+            // Act
+            var actual = EquityFfbUpfrontTaxComputationConsumer.ConsumerName;
+
+            // Assert
+            Assert.That(actual, Is.EqualTo(expected),
+                "ConsumerName must match the expected service consumer identifier.");
+        }
+
+        [Test]
+        public void SafeProcess_WhenMessageIsNotTradeMessage_ShouldIgnoreWithoutTouchingServices()
+        {
+            // Arrange
+            var coreServiceMock = new Mock<ICoreDirectoryService>(MockBehavior.Strict);
+            var nonTradeMessage = new Mock<DefaultMessage>().Object;
+            using var _ = MockData.Given(given => given.ServiceMocks(coreServiceMock));
+            var consumer = BuildConsumer();
+
+            // Act / Assert
+            Assert.That(() => consumer.SafeProcess(nonTradeMessage), Throws.Nothing,
+                "A non-TradeMessage must be ignored without error.");
+            coreServiceMock.VerifyNoOtherCalls();
+        }
+
+        [Test]
+        public void SafeProcess_WhenMessageAlreadyProcessed_ShouldReturnWithoutProcessing()
+        {
+            // Arrange
+            var trade = CreateValidFfbIndexTrade();
+            var message = CreateMessage(trade);
+
+            var coreServiceMock = new Mock<ICoreDirectoryService>(MockBehavior.Strict);
+            coreServiceMock
+                .Setup(s => s.IsMessageProcessed(message.Id, ConsumerName, AssetClass.EQUITYOTC))
+                .Returns(true)
+                .Verifiable();
+
+            using var _ = MockData.Given(given => given.ServiceMocks(coreServiceMock));
+            var consumer = BuildConsumer();
+
+            // Act
+            consumer.SafeProcess(message);
+
+            // Assert
+            coreServiceMock.VerifyAll();
+            coreServiceMock.Verify(
+                s => s.MarkMessageAsProcessing(It.IsAny<long>(), It.IsAny<string>(), It.IsAny<AssetClass>()),
+                Times.Never,
+                "An already-processed message must not be re-marked as processing.");
+        }
+
+        [Test]
+        public void SafeProcess_WhenCannotMarkProcessing_ShouldReturnWithoutProcessing()
+        {
+            // Arrange
+            var trade = CreateValidFfbIndexTrade();
+            var message = CreateMessage(trade);
+
+            var coreServiceMock = new Mock<ICoreDirectoryService>(MockBehavior.Strict);
+            coreServiceMock
+                .Setup(s => s.IsMessageProcessed(message.Id, ConsumerName, AssetClass.EQUITYOTC))
+                .Returns(false)
+                .Verifiable();
+            coreServiceMock
+                .Setup(s => s.MarkMessageAsProcessing(message.Id, ConsumerName, AssetClass.EQUITYOTC))
+                .Returns(0)
+                .Verifiable();
+
+            using var _ = MockData.Given(given => given.ServiceMocks(coreServiceMock));
+            var consumer = BuildConsumer();
+
+            // Act
+            consumer.SafeProcess(message);
+
+            // Assert
+            coreServiceMock.VerifyAll();
+            coreServiceMock.Verify(
+                s => s.MarkProcessingMessageAsProcessed(
+                    It.IsAny<long>(), It.IsAny<string>(), It.IsAny<XOneDateTime>(), It.IsAny<AssetClass>()),
+                Times.Never,
+                "If the message cannot be marked as processing, no further work must happen.");
+        }
+
+        [Test]
+        public void SafeProcess_WhenDividendFetchFails_ShouldMarkErrored()
+        {
+            // Arrange
+            var trade = CreateValidFfbIndexTrade();
+            var message = CreateMessage(trade);
+
+            var coreServiceMock = CreateCoreServiceMockExpectingError(message);
+
+            var staticDataMock = new Mock<IEquityStaticDataService>(MockBehavior.Strict);
+            staticDataMock
+                .Setup(s => s.GetManyEquityFfbCorporateActionUpfrontForRangeOfDateOnIndex(
+                    It.IsAny<string>(), It.IsAny<XOneDate>(), It.IsAny<XOneDate>()))
+                .Throws(new InvalidOperationException("dividend source down"))
+                .Verifiable();
+
+            using var _ = MockData.Given(given => given
+                .AnObject((EliotUnderlying)((EquityOption)trade.Product).Underlying)
+                .ServiceMocks(coreServiceMock, staticDataMock));
+            var consumer = BuildConsumer();
+
+            // Act
+            consumer.SafeProcess(message);
+
+            // Assert
+            staticDataMock.VerifyAll();
+            coreServiceMock.Verify(
+                s => s.MarkProcessingMessageAsErrored(
+                    message.Id, ConsumerName, It.IsAny<XOneDateTime>(), It.IsAny<AssetClass>(),
+                    It.IsAny<ErroredMessage>(), It.IsAny<string>()),
+                Times.Once,
+                "A failing dividend fetch must mark the message as errored, not processed.");
+            coreServiceMock.Verify(
+                s => s.MarkProcessingMessageAsProcessed(
+                    It.IsAny<long>(), It.IsAny<string>(), It.IsAny<XOneDateTime>(), It.IsAny<AssetClass>()),
+                Times.Never);
+        }
+
+        [Test]
+        public void SafeProcess_WhenTradeNotTaxable_ShouldSkipAndMarkProcessed()
+        {
+            // Arrange
+            var trade = CreateNonTaxableFfbTrade();
+            var message = CreateMessage(trade);
+
+            var coreServiceMock = CreateCoreServiceMock(message);
+
+            using var _ = MockData.Given(given => given.ServiceMocks(coreServiceMock));
+            var consumer = BuildConsumer();
+
+            // Act
+            consumer.SafeProcess(message);
+
+            // Assert
+            coreServiceMock.Verify(
+                s => s.MarkProcessingMessageAsProcessed(
+                    message.Id, ConsumerName, It.IsAny<XOneDateTime>(), AssetClass.EQUITYOTC),
+                Times.Once,
+                "A non-taxable trade must be skipped and marked processed.");
+        }
+
+        // Built with the user's proven GetFfbComputationType arrange (ELS + Index + GRTR +
+        // IsEligibleForUpfrontCalculation) which returns a NON-Upfront type -> consumer skips.
+        [Test]
+        public void SafeProcess_WhenComputationTypeNotUpfront_ShouldSkipAndMarkProcessed()
+        {
+            // Arrange
+            var instrumentConfig = InstrumentConfigs.GetInstrumentConfig("EquityLinkedSwap");
+            var trade = instrumentConfig.CreateTradeModelPresenterWithTrade().Trade;
+            trade.XOneReference = new XOneReference(500001, XOneReference.COD_APP_ELIOT) { Version = 1 };
+            trade.ContractId = "ELI-500001";
+            trade.TradeDate = XOneDate.Today;
+
+            var underlying = new EliotUnderlying
+            {
+                UnderlyingName = "TEST_INDEX",
+                UnderlyingType = EquityUnderlyingType.Index,
+                UnderlyingId = 1
+            };
+            var els = new EquityLinkedSwap();
+            els.ReturnLeg.Underlyer = new EquitySingleUnderlier
+            {
+                AssetId = underlying.UnderlyingId,
+                UnderlyingType = underlying.UnderlyingType
+            };
+            trade.Product = els;
+
+            if (trade.TradeAdditionalInformations is EquityOtcTradeInformations tradeInfo)
+            {
+                tradeInfo.IsLinkedToSecurity = true;
+                tradeInfo.EquityEligibilityInformations = new List<EquityEligibilityInformation>
+                {
+                    new()
+                    {
+                        RegulatoryLaw = RegulatoryLaw.FFB,
+                        RegulatoryCode = RegulatoryAuthority.DGFIP,
+                        BusinessEligiblility = true,
+                        SpecificAdditionalRegulatoryInformation =
+                            new Ffb25RegulatoryReportingInformation { TaxStatusCode = "FFBSTDRAPP" }
+                    }
+                };
+            }
+
+            var eliotIndex = new EliotIndex
+            {
+                IndexName = underlying.UnderlyingName,
+                IndexReturnType = "GRTR",
+                UnderlyingId = underlying.UnderlyingId
+            };
+            instrumentConfig.MetaData = new Dictionary<string, IList<string>>
+            {
+                { EquityTradeHelper.IsEligibleForUpfrontCalculationMetaData, new List<string> { "true" } }
+            };
+
+            var message = CreateMessage(trade);
+            var coreServiceMock = CreateCoreServiceMock(message);
+
+            using var _ = MockData.Given(given =>
+            {
+                given.AllObjects(underlying);
+                given.AllObjects(eliotIndex);
+                given.ServiceMocks(coreServiceMock);
+            });
+            var consumer = BuildConsumer();
+
+            // Act
+            consumer.SafeProcess(message);
+
+            // Assert
+            coreServiceMock.Verify(
+                s => s.MarkProcessingMessageAsProcessed(
+                    message.Id, ConsumerName, It.IsAny<XOneDateTime>(), AssetClass.EQUITYOTC),
+                Times.Once,
+                "A non-Upfront computation type must be skipped and marked processed.");
+        }
+
+        [Test]
+        public void SafeProcess_WhenUnderlyingNotFound_ShouldSkipAndMarkProcessed()
+        {
+            // Arrange
+            var trade = CreateFfbTradeWithoutUnderlying();
+            var message = CreateMessage(trade);
+
+            var coreServiceMock = CreateCoreServiceMock(message);
+
+            using var _ = MockData.Given(given => given.ServiceMocks(coreServiceMock));
+            var consumer = BuildConsumer();
+
+            // Act
+            consumer.SafeProcess(message);
+
+            // Assert
+            coreServiceMock.Verify(
+                s => s.MarkProcessingMessageAsProcessed(
+                    message.Id, ConsumerName, It.IsAny<XOneDateTime>(), AssetClass.EQUITYOTC),
+                Times.Once,
+                "A trade with no resolvable underlying must be skipped and marked processed.");
+        }
+
+        [Test]
+        public void SafeProcess_WhenInvalidCalculationPeriod_ShouldSkipAndMarkProcessed()
+        {
+            // Arrange
+            var trade = CreateFfbIndexTradeWithMaturity(XOneDate.Today.AddDays(-1));
+            var message = CreateMessage(trade);
+
+            var coreServiceMock = CreateCoreServiceMock(message);
+
+            using var _ = MockData.Given(given => given
+                .AnObject((EliotUnderlying)((EquityOption)trade.Product).Underlying)
+                .ServiceMocks(coreServiceMock));
+            var consumer = BuildConsumer();
+
+            // Act
+            consumer.SafeProcess(message);
+
+            // Assert
+            coreServiceMock.Verify(
+                s => s.MarkProcessingMessageAsProcessed(
+                    message.Id, ConsumerName, It.IsAny<XOneDateTime>(), AssetClass.EQUITYOTC),
+                Times.Once,
+                "An invalid (past-maturity) calculation period must be skipped and marked processed.");
+        }
+
+        [Test]
+        public void SafeProcess_WhenNoDividends_ShouldSkipAndMarkProcessed()
+        {
+            // Arrange
+            var trade = CreateValidFfbIndexTrade();
+            var message = CreateMessage(trade);
+
+            var coreServiceMock = CreateCoreServiceMock(message);
+
+            var staticDataMock = new Mock<IEquityStaticDataService>(MockBehavior.Strict);
+            staticDataMock
+                .Setup(s => s.GetManyEquityFfbCorporateActionUpfrontForRangeOfDateOnIndex(
+                    It.IsAny<string>(), It.IsAny<XOneDate>(), It.IsAny<XOneDate>()))
+                .Returns(new List<EquityFfbCorporateActionOnIndex>())
+                .Verifiable();
+
+            using var _ = MockData.Given(given => given
+                .AnObject((EliotUnderlying)((EquityOption)trade.Product).Underlying)
+                .ServiceMocks(coreServiceMock, staticDataMock));
+            var consumer = BuildConsumer();
+
+            // Act
+            consumer.SafeProcess(message);
+
+            // Assert
+            staticDataMock.VerifyAll();
+            coreServiceMock.Verify(
+                s => s.MarkProcessingMessageAsProcessed(
+                    message.Id, ConsumerName, It.IsAny<XOneDateTime>(), AssetClass.EQUITYOTC),
+                Times.Once,
+                "An empty dividend set must be skipped and marked processed.");
+        }
+
+        // -------- HAPPY PATHS (RUNTIME-CONFIRM: trade must resolve to Upfront) ----------------
+
+        [Test]
+        public void SafeProcess_WhenFfbEligibleIndexTrade_ShouldProcessAndMarkProcessed()
+        {
+            // Arrange
+            var trade = CreateValidFfbIndexTrade();
+            var message = CreateMessage(trade);
+
+            var coreServiceMock = CreateCoreServiceMock(message);
+
+            var mockDividends = new List<EquityFfbCorporateActionOnIndex>
+            {
+                new() { EligibleAmount = 10.0, EligibleGrossAmount = 15.0 },
+                new() { EligibleAmount = 5.0,  EligibleGrossAmount = 8.0  }
+            };
+            var staticDataMock = new Mock<IEquityStaticDataService>(MockBehavior.Strict);
+            staticDataMock
+                .Setup(s => s.GetManyEquityFfbCorporateActionUpfrontForRangeOfDateOnIndex(
+                    It.IsAny<string>(), It.IsAny<XOneDate>(), It.IsAny<XOneDate>()))
+                .Returns(mockDividends)
+                .Verifiable();
+
+            using var _ = MockData.Given(given => given
+                .AnObject((EliotUnderlying)((EquityOption)trade.Product).Underlying)
+                .ServiceMocks(coreServiceMock, staticDataMock));
+            var consumer = BuildConsumer();
+
+            // Act
+            consumer.SafeProcess(message);
+
+            // Assert
+            staticDataMock.VerifyAll();
+            coreServiceMock.Verify(
+                s => s.MarkProcessingMessageAsProcessed(
+                    message.Id, ConsumerName, It.IsAny<XOneDateTime>(), AssetClass.EQUITYOTC),
+                Times.Once,
+                "An FFB-eligible index trade with dividends must be processed and marked processed.");
+        }
+
+        [Test]
+        public void SafeProcess_WhenFfbEligibleStockTrade_ShouldProcessAndMarkProcessed()
+        {
+            // Arrange
+            var trade = CreateValidFfbStockTrade();
+            var message = CreateMessage(trade);
+
+            var coreServiceMock = CreateCoreServiceMock(message);
+
+            var expectedCorporateAction = new EquityCorporateAction
+            {
+                CorporateMethod = CorporateMethod.CashDividend,
+                ApplicationDate = new XOneDate(2026, 01, 05),
+                Definition = new EquityDividend
+                {
+                    UnderlyingId = "TOTAL_X",
+                    GrossAmount = 10,
+                    NetAmount = 8,
+                    CurrencyId = "EUR"
+                }
+            };
+
+            var streamingMock = new Mock<IEquityStaticDataStreamingService>(MockBehavior.Strict);
+            streamingMock
+                .Setup(s => s.StreamCorporateActionsDividendEstimated(
+                    It.IsAny<string>(), It.IsAny<XOneDate>(), It.IsAny<XOneDate>()))
+                .Returns(new RequestStream(new[] { expectedCorporateAction }.AsStream()))
+                .Verifiable();
+
+            using var _ = MockData.Given(given => given
+                .AnObject((EliotUnderlying)((EquityOption)trade.Product).Underlying)
+                .ServiceMocks(coreServiceMock, streamingMock));
+            var consumer = BuildConsumer();
+
+            // Act
+            consumer.SafeProcess(message);
+
+            // Assert
+            streamingMock.VerifyAll();
+            coreServiceMock.Verify(
+                s => s.MarkProcessingMessageAsProcessed(
+                    message.Id, ConsumerName, It.IsAny<XOneDateTime>(), AssetClass.EQUITYOTC),
+                Times.Once,
+                "An FFB-eligible stock trade with a dividend must be processed and marked processed.");
+        }
+
+        [Test]
+        public void SafeProcess_WhenFfbEligibleBasketTrade_ShouldAggregateStockComponentDividends()
+        {
+            // Arrange
+            var trade = CreateValidFfbBasketTrade();
+            var message = CreateMessage(trade);
+
+            var coreServiceMock = CreateCoreServiceMock(message);
+
+            var basket = new EquityBasket
+            {
+                Components = new List<EquityBasketComponent>
+                {
+                    new EquityBasketComponent { AssetId = "STOCK_A", Type = EquityUnderlyingType.Stock },
+                    new EquityBasketComponent { AssetId = "STOCK_B", Type = EquityUnderlyingType.Stock },
+                    new EquityBasketComponent { AssetId = "STOCK_C", Type = EquityUnderlyingType.Index }
+                }
+            };
+
+            var equityTradeServiceMock = new Mock<IEquityTradeService>(MockBehavior.Strict);
+            equityTradeServiceMock
+                .Setup(s => s.GetEquityBasketByName(It.IsAny<string>()))
+                .Returns(basket)
+                .Verifiable();
+
+            var streamingMock = new Mock<IEquityStaticDataStreamingService>(MockBehavior.Strict);
+            streamingMock
+                .Setup(s => s.StreamCorporateActionsDividendEstimated(
+                    It.IsAny<string>(), It.IsAny<XOneDate>(), It.IsAny<XOneDate>()))
+                .Returns(new RequestStream(Array.Empty<EquityCorporateAction>().AsStream()))
+                .Verifiable();
+
+            using var _ = MockData.Given(given => given
+                .ServiceMocks(coreServiceMock, equityTradeServiceMock, streamingMock));
+            var consumer = BuildConsumer();
+
+            // Act
+            consumer.SafeProcess(message);
+
+            // Assert
+            equityTradeServiceMock.Verify(s => s.GetEquityBasketByName(It.IsAny<string>()), Times.Once);
+            streamingMock.Verify(
+                s => s.StreamCorporateActionsDividendEstimated(
+                    It.IsAny<string>(), It.IsAny<XOneDate>(), It.IsAny<XOneDate>()),
+                Times.Exactly(2),
+                "Only the two STOCK components must be streamed; the Index component must be skipped.");
+            coreServiceMock.Verify(
+                s => s.MarkProcessingMessageAsProcessed(
+                    message.Id, ConsumerName, It.IsAny<XOneDateTime>(), AssetClass.EQUITYOTC),
+                Times.Once);
+        }
+
+        // -------- ComputeUpfrontTax: PURE MATH (no pipeline, no NATS) -------------------------
+
+        [Test]
+        public void ComputeUpfrontTax_WhenDividendListIsNull_ShouldReturnZeroTaxAndZeroCount()
+        {
+            // Arrange
+            var consumer = BuildConsumer();
+            var trade = CreateFfbUpfrontEligibleTrade();
+
+            // Act
+            var (totalTax, count) = consumer.ComputeUpfrontTax(trade, null);
+
+            // Assert
+            Assert.That(totalTax, Is.EqualTo(0d), "Null dividend list must produce zero tax.");
+            Assert.That(count, Is.EqualTo(0), "Null dividend list must report zero processed dividends.");
+        }
+
+        [Test]
+        public void ComputeUpfrontTax_WhenDividendListIsEmpty_ShouldReturnZeroTaxAndZeroCount()
+        {
+            // Arrange
+            var consumer = BuildConsumer();
+            var trade = CreateFfbUpfrontEligibleTrade();
+
+            // Act
+            var (totalTax, count) = consumer.ComputeUpfrontTax(
+                trade, new List<EquityFfbUpfrontTaxComputationConsumer.UpfrontDividend>());
+
+            // Assert
+            Assert.That(totalTax, Is.EqualTo(0d), "Empty dividend list must produce zero tax.");
+            Assert.That(count, Is.EqualTo(0), "Empty dividend list must report zero processed dividends.");
+        }
+
+        [Test]
+        public void ComputeUpfrontTax_WithZeroDividendAmounts_ShouldCountDividendButReturnZeroTax()
+        {
+            // Arrange
+            var consumer = BuildConsumer();
+            var trade = CreateFfbUpfrontEligibleTrade(remainingQuantity: 100d);
+
+            // Act
+            var (totalTax, count) = consumer.ComputeUpfrontTax(
+                trade,
+                new List<EquityFfbUpfrontTaxComputationConsumer.UpfrontDividend>
+                {
+                    new(NetAmount: 0d, GrossAmount: 0d)
+                });
+
+            // Assert
+            Assert.That(count, Is.EqualTo(1), "One dividend must be counted regardless of its amounts.");
+            Assert.That(totalTax, Is.EqualTo(0d), "Zero net and gross dividend amounts must produce zero tax.");
+        }
+
+        [Test]
+        public void ComputeUpfrontTax_WithSingleValidDividend_ShouldReturnPositiveTaxAndCountOne()
+        {
+            // Arrange
+            var consumer = BuildConsumer();
+            var trade = CreateFfbUpfrontEligibleTrade(remainingQuantity: 100d);
+
+            // Act
+            var (totalTax, count) = consumer.ComputeUpfrontTax(
+                trade,
+                new List<EquityFfbUpfrontTaxComputationConsumer.UpfrontDividend>
+                {
+                    new(NetAmount: 10d, GrossAmount: 12d)
+                });
+
+            // Assert
+            Assert.That(count, Is.EqualTo(1), "One valid dividend must set count to 1.");
+            Assert.That(totalTax, Is.GreaterThan(0d),
+                "A valid single dividend with a known tax rate must produce a strictly positive tax.");
+        }
+
+        [Test]
+        public void ComputeUpfrontTax_WithMultipleDividends_ShouldAggregateAmountsAndComputeTaxOnce()
+        {
+            // Arrange
+            var consumer = BuildConsumer();
+            var trade = CreateFfbUpfrontEligibleTrade(
+                remainingQuantity: 100d, underlyingName: "UNKNOWN_RATE_STOCK_X", taxStatusCode: "FFBSTDRAPP");
+            var dividends = new List<EquityFfbUpfrontTaxComputationConsumer.UpfrontDividend>
+            {
+                new(NetAmount: 5d, GrossAmount: 8d),
+                new(NetAmount: 5d, GrossAmount: 8d)
+            };
+
+            // Act
+            var (totalTax, count) = consumer.ComputeUpfrontTax(trade, dividends);
+
+            // Assert
+            const double expectedBase = 10d;                       // min(net=10, gross=16)
+            const double expected = 100d * 1d * 1d * expectedBase; // qty * delta * pointValue * base
+            Assert.That(count, Is.EqualTo(2), "Two dividends must produce count=2.");
+            Assert.That(totalTax, Is.EqualTo(expected),
+                "Dividends must be aggregated before tax is computed once on the total.");
+        }
+
+        [Test]
+        public void ComputeUpfrontTax_WhenGrossIsSmaller_ShouldChooseGrossPath()
+        {
+            // Arrange
+            var consumer = BuildConsumer();
+            var trade = CreateFfbUpfrontEligibleTrade(
+                remainingQuantity: 100d, underlyingName: "UNKNOWN_RATE_STOCK_X", taxStatusCode: "FFBSTDRAPP");
+
+            // Act
+            var (totalTax, _) = consumer.ComputeUpfrontTax(
+                trade,
+                new List<EquityFfbUpfrontTaxComputationConsumer.UpfrontDividend>
+                {
+                    new(NetAmount: 100d, GrossAmount: 5d)
+                });
+
+            // Assert
+            const double expected = 100d * 1d * 1d * 5d; // min(100, 5) = 5
+            Assert.That(totalTax, Is.EqualTo(expected),
+                "When the gross total is smaller it must be chosen as the tax base.");
+        }
+
+        [Test]
+        public void ComputeUpfrontTax_WhenNetIsSmaller_ShouldChooseNetPath()
+        {
+            // Arrange
+            var consumer = BuildConsumer();
+            var trade = CreateFfbUpfrontEligibleTrade(
+                remainingQuantity: 100d, underlyingName: "UNKNOWN_RATE_STOCK_X", taxStatusCode: "FFBSTDRAPP");
+
+            // Act
+            var (totalTax, _) = consumer.ComputeUpfrontTax(
+                trade,
+                new List<EquityFfbUpfrontTaxComputationConsumer.UpfrontDividend>
+                {
+                    new(NetAmount: 5d, GrossAmount: 100d)
+                });
+
+            // Assert
+            const double expected = 100d * 1d * 1d * 5d; // min(5, 100) = 5
+            Assert.That(totalTax, Is.EqualTo(expected),
+                "When the net total is smaller it must be chosen as the tax base.");
+        }
+
+        [Test]
+        public void ComputeUpfrontTax_WhenTaxRateIsNaN_ShouldReturnZeroTaxButStillCount()
+        {
+            // Arrange
+            var option = new EquityOption("EquityOption")
+            {
+                Underlying = new EliotUnderlying
+                {
+                    UnderlyingName = "TOTAL_X",
+                    UnderlyingType = EquityUnderlyingType.Stock,
+                    UnderlyingIsActive = true
+                }
+            };
+            option.ChangeMaturityDate(s_maturityDate);
+
+            var tradeNoFfbRegInfo = new Trade
+            {
+                XOneReference = new XOneReference(AssetClass.EQUITYOTC, 399001) { Version = 1 },
+                ContractId = "ELI-399001",
+                TradeDate = s_tradeDate,
+                Product = option,
+                TradeAdditionalInformations = new EquityLinkedSwapTradeInformations
+                {
+                    IsLinkedToSecurity = true,
+                    RemainingQuantity = 100d,
+                    EquityEligibilityInformations = new List<EquityEligibilityInformation>()
+                }
+            };
+
+            Assert.That(double.IsNaN(EquityFfbHelper.GetFfbTaxLevel(tradeNoFfbRegInfo, s_tradeDate)), Is.True,
+                "Precondition: tax level must be NaN when no FFB regulatory info is present.");
+
+            var consumer = BuildConsumer();
+
+            // Act
+            var (totalTax, count) = consumer.ComputeUpfrontTax(
+                tradeNoFfbRegInfo,
+                new List<EquityFfbUpfrontTaxComputationConsumer.UpfrontDividend>
+                {
+                    new(NetAmount: 10d, GrossAmount: 12d)
+                });
+
+            // Assert
+            Assert.That(totalTax, Is.EqualTo(0d), "A NaN tax rate must produce zero tax.");
+            Assert.That(count, Is.EqualTo(1), "The dividend must still be counted even when the tax rate is invalid.");
+        }
+
+        [Test]
+        public void ComputeUpfrontTax_WhenRemainingQuantityIsZero_ShouldReturnZeroTaxButStillCount()
+        {
+            // Arrange
+            var consumer = BuildConsumer();
+            var trade = CreateFfbUpfrontEligibleTrade(remainingQuantity: 0d);
+
+            // Act
+            var (totalTax, count) = consumer.ComputeUpfrontTax(
+                trade,
+                new List<EquityFfbUpfrontTaxComputationConsumer.UpfrontDividend>
+                {
+                    new(NetAmount: 10d, GrossAmount: 12d)
+                });
+
+            // Assert
+            Assert.That(totalTax, Is.EqualTo(0d), "Zero remaining quantity must produce zero tax.");
+            Assert.That(count, Is.EqualTo(1), "The dividend must still be counted.");
+        }
+
+        [Test]
+        public void ComputeUpfrontTax_WhenNetAndGrossAreNegative_ShouldReturnZeroTaxButStillCount()
+        {
+            // Arrange
+            var consumer = BuildConsumer();
+            var trade = CreateFfbUpfrontEligibleTrade(remainingQuantity: 100d);
+
+            // Act
+            var (totalTax, count) = consumer.ComputeUpfrontTax(
+                trade,
+                new List<EquityFfbUpfrontTaxComputationConsumer.UpfrontDividend>
+                {
+                    new(NetAmount: -5d, GrossAmount: -3d)
+                });
+
+            // Assert
+            Assert.That(totalTax, Is.EqualTo(0d), "Negative net and gross dividend amounts must produce zero tax.");
+            Assert.That(count, Is.EqualTo(1), "The dividend must still be counted.");
+        }
+
+        // ----------------------------------------------------------------------------------------
+        //  Builders and strict mock factories
+        // ----------------------------------------------------------------------------------------
+
+        private static Mock<ICoreDirectoryService> CreateCoreServiceMock(TradeMessage message)
+        {
+            var mock = new Mock<ICoreDirectoryService>(MockBehavior.Strict);
+            mock.Setup(s => s.IsMessageProcessed(message.Id, ConsumerName, AssetClass.EQUITYOTC))
+                .Returns(false);
+            mock.Setup(s => s.MarkMessageAsProcessing(message.Id, ConsumerName, AssetClass.EQUITYOTC))
+                .Returns(1);
+            mock.Setup(s => s.MarkProcessingMessageAsProcessed(
+                    message.Id, ConsumerName, It.IsAny<XOneDateTime>(), AssetClass.EQUITYOTC))
+                .Returns(1);
+            return mock;
+        }
+
+        private static Mock<ICoreDirectoryService> CreateCoreServiceMockExpectingError(TradeMessage message)
+        {
+            var mock = new Mock<ICoreDirectoryService>(MockBehavior.Strict);
+            mock.Setup(s => s.IsMessageProcessed(message.Id, ConsumerName, AssetClass.EQUITYOTC))
+                .Returns(false);
+            mock.Setup(s => s.MarkMessageAsProcessing(message.Id, ConsumerName, AssetClass.EQUITYOTC))
+                .Returns(1);
+            mock.Setup(s => s.MarkProcessingMessageAsErrored(
+                    It.IsAny<long>(), It.IsAny<string>(), It.IsAny<XOneDateTime>(), It.IsAny<AssetClass>(),
+                    It.IsAny<ErroredMessage>(), It.IsAny<string>()))
+                .Returns(1);
+            return mock;
+        }
+
+        private static TradeDescriptor CreateDescriptorFor(Trade trade) =>
+            new TradeDescriptor
+            {
+                XOneReference = trade.XOneReference,
+                TradeDate = trade.TradeDate,
+                InstrumentName = "EquityOption",
+                AssetClass = AssetClass.EQUITYOTC
+            };
+
+        // Carries the trade ON the message: _innerTrade is set, so GetTrade() returns it offline.
+        private static TradeMessage CreateMessage(Trade trade) =>
+            new TradeMessage(trade, CreateDescriptorFor(trade), null, TradeMessageSource.DatabaseNotification);
+
+        private static Trade CreateValidFfbIndexTrade() =>
+            CreateFfbIndexTradeWithMaturity(XOneDate.Today.AddMonths(1));
+
+        private static Trade CreateFfbIndexTradeWithMaturity(XOneDate maturity)
+        {
+            var underlying = new EliotUnderlying
+            {
+                UnderlyingName = "CAC40_X",
+                UnderlyingType = EquityUnderlyingType.Index,
+                UnderlyingIsActive = true
+            };
+            var product = new EquityOption("EquityOption") { Underlying = underlying };
+            product.ChangeMaturityDate(maturity);
+            return BuildFfbTrade(product, "ELI-12345");
+        }
+
+        private static Trade CreateValidFfbStockTrade()
+        {
+            var underlying = new EliotUnderlying
+            {
+                UnderlyingName = "TOTAL_X",
+                UnderlyingType = EquityUnderlyingType.Stock,
+                UnderlyingIsActive = true
+            };
+            var product = new EquityOption("EquityOption") { Underlying = underlying };
+            product.ChangeMaturityDate(XOneDate.Today.AddMonths(1));
+            return BuildFfbTrade(product, "ELI-200001");
+        }
+
+        private static Trade CreateValidFfbBasketTrade()
+        {
+            var underlying = new EliotUnderlying
+            {
+                UnderlyingName = "BASKET_1",
+                UnderlyingType = EquityUnderlyingType.Basket,
+                UnderlyingIsActive = true
+            };
+            var product = new EquityOption("EquityOption") { Underlying = underlying };
+            product.ChangeMaturityDate(XOneDate.Today.AddMonths(1));
+            return BuildFfbTrade(product, "ELI-300001");
+        }
+
+        private static Trade CreateNonTaxableFfbTrade()
+        {
+            var underlying = new EliotUnderlying
+            {
+                UnderlyingName = "CAC40_X",
+                UnderlyingType = EquityUnderlyingType.Index,
+                UnderlyingIsActive = true
+            };
+            var product = new EquityOption("EquityOption") { Underlying = underlying };
+            product.ChangeMaturityDate(XOneDate.Today.AddMonths(1));
+            return BuildFfbTrade(product, "ELI-400001", businessEligible: false);
+        }
+
+        private static Trade CreateFfbTradeWithoutUnderlying()
+        {
+            var product = new EquityOption("EquityOption") { Underlying = null };
+            product.ChangeMaturityDate(XOneDate.Today.AddMonths(1));
+            return BuildFfbTrade(product, "ELI-600001");
+        }
+
+        private static Trade BuildFfbTrade(EquityOption product, string contractId, bool businessEligible = true) =>
+            new Trade
+            {
+                XOneReference = new XOneReference(AssetClass.EQUITYOTC, 12345) { Version = 1 },
+                ContractId = contractId,
+                TradeDate = XOneDate.Today,
+                Product = product,
+                TradeAdditionalInformations = new EquityOtcTradeInformations
+                {
+                    IsLinkedToSecurity = true,
+                    RemainingQuantity = 100,
+                    EquityEligibilityInformations = new List<EquityEligibilityInformation>
+                    {
+                        new()
+                        {
+                            RegulatoryLaw = RegulatoryLaw.FFB,
+                            RegulatoryCode = RegulatoryAuthority.DGFIP,
+                            BusinessEligiblility = businessEligible,
+                            SpecificAdditionalRegulatoryInformation =
+                                new Ffb25RegulatoryReportingInformation { TaxStatusCode = "DEFAULT" }
+                        }
+                    }
+                }
+            };
+
+        private static Trade CreateFfbUpfrontEligibleTrade(
+            string contractId = "ELI-300001",
+            string underlyingName = "TOTAL_X",
+            EquityUnderlyingType underlyingType = EquityUnderlyingType.Stock,
+            double remainingQuantity = 100d,
+            XOneDate? tradeDate = null,
+            XOneDate? maturityDate = null,
+            string taxStatusCode = "FFBSTDRAPP")
+        {
+            var option = new EquityOption("EquityOption")
+            {
+                Underlying = new EliotUnderlying
+                {
+                    UnderlyingName = underlyingName,
+                    UnderlyingType = underlyingType,
+                    UnderlyingIsActive = true
+                }
+            };
+            option.ChangeMaturityDate(maturityDate ?? s_maturityDate);
+
+            return new Trade
+            {
+                XOneReference = new XOneReference(AssetClass.EQUITYOTC, 300001) { Version = 1 },
+                ContractId = contractId,
+                TradeDate = tradeDate ?? s_tradeDate,
+                Product = option,
+                TradeAdditionalInformations = new EquityLinkedSwapTradeInformations
+                {
+                    IsLinkedToSecurity = true,
+                    RemainingQuantity = remainingQuantity,
+                    EquityEligibilityInformations = new List<EquityEligibilityInformation>
+                    {
+                        new EquityEligibilityInformation(RegulatoryLaw.FFB, RegulatoryAuthority.DGFIP)
+                        {
+                            BusinessEligiblility = true,
+                            SpecificAdditionalRegulatoryInformation =
+                                new Ffb25RegulatoryReportingInformation { TaxStatusCode = taxStatusCode }
+                        }
+                    }
+                }
+            };
+        }
+    }
+}
